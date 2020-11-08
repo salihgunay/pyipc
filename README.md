@@ -1,5 +1,5 @@
 # pyipc
-A fast, robust and stable asynchronous inter process communication over websockets api
+A fast, robust and lightweight asynchronous inter process communication over websockets api
 
 Usage
 -----
