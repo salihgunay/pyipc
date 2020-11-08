@@ -1,7 +1,7 @@
 import asyncio
 from src.ipc import IPC
 import time
-import uvloop
+import uvloop  # Optional
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 

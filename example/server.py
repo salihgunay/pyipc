@@ -1,11 +1,11 @@
 import asyncio
 import websockets
 from src.ipc import IPC
-import uvloop
+import uvloop  # Optional
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
-class Echo:
+class MyClass:
 
     def echo(self, *args, **kwargs):
         return args, kwargs
@@ -20,7 +20,7 @@ class Echo:
 
 
 async def echo(websocket, path):
-    ipc_server = IPC(ws=websocket, cls=Echo(), mode="server")
+    ipc_server = IPC(ws=websocket, cls=MyClass(), mode="server")
     await ipc_server.listen()
 
 if __name__ == "__main__":
