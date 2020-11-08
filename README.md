@@ -7,7 +7,9 @@ Usage
 IPC methods can be used as ``ipc.proxy.method(*args, **kwarg)``.
 
 
-###Server
+#### Server
+
+
 The following code implements a simple IPC server that serves MyClass as endpoint
 
 ```python
@@ -42,7 +44,7 @@ if __name__ == "__main__":
 ```
 
 
-###Client
+#### Client
 The following code implements a simple IPC client that that connects to server above and calls MyClass' methods
 
 ```python
