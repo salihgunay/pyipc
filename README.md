@@ -13,7 +13,6 @@ The following code implements a simple IPC server that serves MyClass as endpoin
 
 .. code-block:: python
 
-
     import asyncio
     import websockets
     from src.ipc import IPC
@@ -66,7 +65,6 @@ The following code implements a simple IPC server that serves MyClass as endpoin
     
           run_app(app, host='0.0.0.0', port=8080)
 
-~~~~~
 Client
 ~~~~~~
 
