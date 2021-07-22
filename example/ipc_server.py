@@ -1,6 +1,6 @@
 import asyncio
 import websockets
-from src.ipc import IPC
+from src.ipc import AsyncIpcServer, MAX_SIZE
 import uvloop  # Optional
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -18,11 +18,12 @@ class MyClass:
     def sum(a: float, b: float) -> float:
         return a + b
 
+my_class = MyClass()
 
 async def echo(websocket, path):
-    ipc_server = IPC(ws=websocket, cls=MyClass(), mode="server")
+    ipc_server = AsyncIpcServer(my_class, websocket)
     await ipc_server.listen()
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(websockets.serve(echo, 'localhost', 8765, max_size=1_000_000_000))
+    asyncio.get_event_loop().run_until_complete(websockets.serve(echo, 'localhost', 8765, max_size=MAX_SIZE))
     asyncio.get_event_loop().run_forever()
