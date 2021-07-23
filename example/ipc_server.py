@@ -18,7 +18,9 @@ class MyClass:
     def sum(a: float, b: float) -> float:
         return a + b
 
+
 my_class = MyClass()
+
 
 async def echo(websocket, path):
     ipc_server = AsyncIpcServer(my_class, websocket)

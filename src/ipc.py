@@ -53,7 +53,6 @@ class MessageObject:
 
 class AsyncIpcClient:
     _listen_task = None
-    _auto_ping_task = None
 
     def __init__(self, host: str = 'localhost', port: int = 8765):
         self._host = host
@@ -63,20 +62,35 @@ class AsyncIpcClient:
         self.proxy = Proxy(self._send)
         self.ws = None
 
-    async def connect(self):
-        self.ws = await websockets.connect(f'ws://{self._host}:{self._port}', max_size=MAX_SIZE, ping_interval=None)
-        self._listen_task = asyncio.create_task(self.listen())
-        self._auto_ping_task = asyncio.create_task(self._auto_ping())
+    @property
+    def connected(self) -> bool:
+        return self.ws.open
 
-    async def _auto_ping(self):
-        while True:
-            await self.proxy.ping_()
-            await asyncio.sleep(PING_INTERVAL)
+    async def connect(self):
+        if not self.ws:
+            self.ws = await websockets.connect(f'ws://{self._host}:{self._port}', max_size=MAX_SIZE, ping_interval=None)
+        if not self._listen_task:
+            self._listen_task = asyncio.create_task(self.listen())
+
+    async def _resend_tasks(self):
+        task: asyncio.Future
+        message_object: MessageObject
+        print(f"resending {len(self.tasks)} tasks")
+        for task, message_object in self.tasks.values():
+            await self.ws.send(dumps(message_object))
+
+    async def _reconnect(self):
+        print("reconnecting")
+        await self.disconnect()
+        await self.connect()
+        await self._resend_tasks()
 
     async def disconnect(self):
-        self._listen_task.cancel()
-        self._auto_ping_task.cancel()
-        await self.ws.close()
+        if self._listen_task and self._listen_task.done():
+            self._listen_task = None
+        if self.ws:
+            await self.ws.close()
+            self.ws = None
 
     async def listen(self):
         try:
@@ -86,35 +100,52 @@ class AsyncIpcClient:
         except websockets.ConnectionClosedError as e:
             print(f"Connection Closed Error in _listen: {e}")
         except Exception as e:
-            print(f"Other Exception listen in client: {e}")
+            print(f"Other Exception in client _listen: {e}")
+        asyncio.ensure_future(self._reconnect())
 
     async def _on_message(self, message_object: MessageObject):
+        future, message_object_ = self.tasks.pop(message_object.message_id)
+        if future.done():
+            return
+
         if message_object.error:
-            self.tasks.pop(message_object.message_id).set_exception(message_object.result)
+            future.set_exception(message_object.result)
         else:
-            self.tasks.pop(message_object.message_id).set_result(message_object.result)
+            future.set_result(message_object.result)
 
     async def _send(self, message_object: MessageObject):
+        future = asyncio.Future()
         try:
-            future = asyncio.Future()
-            self.tasks[message_object.message_id] = future
-            await self.ws.send(dumps(message_object))
-            return await future
-        except websockets.ConnectionClosedError as e:
-            print(f"Connection Closed Error in send: {e}")
+            self.tasks[message_object.message_id] = (future, message_object)
+            if self.connected:
+                await self.ws.send(dumps(message_object))
+        except (websockets.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK) as e:
+            #print(f"Connection Closed Error in client _send: {e}")
+            pass  # if Connection error happens reconnecting with listen
         except KeyError as e:
-            print(f"Key Error in send: {e}")
+            print(f"Key Error in client _send: {e}")
         except Exception as e:
             print(f"Other Exception in client _send: {e}")
+        return await future
 
 
 class AsyncIpcServer:
+
     def __init__(self, klass, ws):
         self.ws = ws
         self.klass = klass
+        # delete me later
+        asyncio.ensure_future(self.disconnect())
+
+    @property
+    def connected(self) -> bool:
+        return not self.ws.closed
 
     async def disconnect(self):
+        print("dis connectiong")
+        await asyncio.sleep(5)
         await self.ws.close()
+        print("disconnected")
 
     async def listen(self):
         try:
@@ -122,25 +153,27 @@ class AsyncIpcServer:
                 message_object: MessageObject = loads(message)
                 asyncio.ensure_future(self._on_message(message_object))
         except websockets.ConnectionClosedError as e:
-            print(f"Connection Closed Error in _listen: {e}")
+            #print(f"Connection Closed Error in server _listen: {e}")
+            pass  # Wait for client to reconnect
         except Exception as e:
-            print(f"Other Exception in listen server: {e}")
+            print(f"Other Exception in server listen: {e}")
 
     async def _on_message(self, message_object: MessageObject):
-        if message_object.function_name == 'ping_':  # Special function name for auto ping
-            message_object.result = True
-        else:
-            result = None
-            try:
-                func = getattr(self.klass, message_object.function_name)
-                result = await func(*message_object.args, **message_object.kwargs) if \
-                    asyncio.iscoroutinefunction(func) else func(*message_object.args, **message_object.kwargs)
-            except Exception as e:
-                message_object.error = True
-                result = e
-            finally:
-                message_object.result = result
-        await self.ws.send(dumps(message_object))
+        result = None
+        try:
+            func = getattr(self.klass, message_object.function_name)
+            result = await func(*message_object.args, **message_object.kwargs) if \
+                asyncio.iscoroutinefunction(func) else func(*message_object.args, **message_object.kwargs)
+        except Exception as e:
+            message_object.error = True
+            result = e
+        finally:
+            message_object.result = result
+        try:
+            if self.connected:
+                await self.ws.send(dumps(message_object))
+        except (websockets.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK):
+            pass  # Connection lost, delete instance and wait for another connection
 
 
 class Proxy:
