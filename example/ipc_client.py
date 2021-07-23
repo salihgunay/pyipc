@@ -9,21 +9,25 @@ import random
 
 
 async def call_later(jobs):
-    await asyncio.sleep(random.random() * 10)
-    await asyncio.gather(*jobs)
+    await asyncio.sleep(random.random() * 3)
+    res = await asyncio.gather(*jobs)
+    #print("other res", res)
 
 
 async def call():
     ipc = AsyncIpcClient()
     await ipc.connect()
     my_class = ipc.proxy  # Get class instance proxy
+    items = 20_000
     while True:
-        jobs = [my_class.echo("hello world!") for _ in range(100)]
-        random_jobs = [my_class.echo("hello world!") for _ in range(250)]
-        asyncio.ensure_future(call_later(random_jobs))
+        jobs = [my_class.echo(1, 2, 3, me="hello", you=3) for _ in range(items)]
+        t = time.time()
         res = await asyncio.gather(*jobs)
-        print("finished", res)
-        await asyncio.sleep(10)
+        print(f"it took {(time.time() -t):.2f} seconds to complete {items} requests.\n"
+              f"One request took {(time.time()-t) / items * 1000:.4f} millisecond")
+        print(res[0])
+
+
 
     await ipc.disconnect()
 

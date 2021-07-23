@@ -67,8 +67,7 @@ class AsyncIpcClient:
         return self.ws.open
 
     async def connect(self):
-        if not self.ws:
-            self.ws = await websockets.connect(f'ws://{self._host}:{self._port}', max_size=MAX_SIZE, ping_interval=None)
+        self.ws = await websockets.connect(f'ws://{self._host}:{self._port}', max_size=MAX_SIZE, ping_interval=None)
         if not self._listen_task:
             self._listen_task = asyncio.create_task(self.listen())
 
@@ -88,9 +87,8 @@ class AsyncIpcClient:
     async def disconnect(self):
         if self._listen_task and self._listen_task.done():
             self._listen_task = None
-        if self.ws:
+        if self.ws.open:
             await self.ws.close()
-            self.ws = None
 
     async def listen(self):
         try:
@@ -134,8 +132,6 @@ class AsyncIpcServer:
     def __init__(self, klass, ws):
         self.ws = ws
         self.klass = klass
-        # delete me later
-        asyncio.ensure_future(self.disconnect())
 
     @property
     def connected(self) -> bool:
@@ -153,7 +149,7 @@ class AsyncIpcServer:
                 message_object: MessageObject = loads(message)
                 asyncio.ensure_future(self._on_message(message_object))
         except websockets.ConnectionClosedError as e:
-            #print(f"Connection Closed Error in server _listen: {e}")
+            print(f"Connection Closed Error in server _listen: {e}")
             pass  # Wait for client to reconnect
         except Exception as e:
             print(f"Other Exception in server listen: {e}")
@@ -172,7 +168,8 @@ class AsyncIpcServer:
         try:
             if self.connected:
                 await self.ws.send(dumps(message_object))
-        except (websockets.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK):
+        except (websockets.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK) as e:
+            print("server _on_message", e)
             pass  # Connection lost, delete instance and wait for another connection
 
 
