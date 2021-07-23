@@ -10,12 +10,12 @@ PING_INTERVAL = 10
 
 
 class MessageObject:
-    def __init__(self, function_name: str, message_id: int, *args,  result=None, **kwargs):
-        self._function_name = function_name
-        self._message_id = message_id
+    def __init__(self, function_name_: str, message_id_: int, *args, **kwargs):
+        self._function_name = function_name_
+        self._message_id = message_id_
         self._args = args
         self._kwargs = kwargs
-        self._result = result
+        self._result = None
         self._error = False
 
     @property
@@ -54,13 +54,14 @@ class MessageObject:
 class AsyncIpcClient:
     _listen_task = None
 
-    def __init__(self, host: str = 'localhost', port: int = 8765):
+    def __init__(self, host: str = 'localhost', port: int = 8765, connection_lost_callback=None):
         self._host = host
         self._port = port
         self._iter = count()
         self.tasks: [Dict, asyncio.Future] = {}
         self.proxy = Proxy(self._send)
         self.ws = None
+        self._connection_lost_callback = connection_lost_callback
 
     @property
     def connected(self) -> bool:
@@ -89,6 +90,11 @@ class AsyncIpcClient:
             self._listen_task = None
         if self.ws.open:
             await self.ws.close()
+
+        if asyncio.iscoroutinefunction(self._connection_lost_callback):
+            await self._connection_lost_callback()
+        elif callable(self._connection_lost_callback):
+            self._connection_lost_callback()
 
     async def listen(self):
         try:
@@ -185,8 +191,8 @@ class Proxy:
             self._iter = count()
         return message_id
 
-    def __getattr__(self, function_name):
+    def __getattr__(self, function_name_):
         async def func(*args, **kwargs):
-            message_object = MessageObject(function_name, self._next_message_id, *args, *kwargs)
+            message_object = MessageObject(function_name_, self._next_message_id, *args, **kwargs)
             return await self._send(message_object)
         return func
