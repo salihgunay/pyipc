@@ -102,7 +102,7 @@ class AsyncIpcClient:
                 message_object: MessageObject = loads(message)
                 asyncio.ensure_future(self._on_message(message_object))
         except websockets.ConnectionClosedError as e:
-            print(f"Connection Closed Error in _listen: {e}")
+            print(f"Connection Closed Error in client _listen: {e}")
         except Exception as e:
             print(f"Other Exception in client _listen: {e}")
         asyncio.ensure_future(self._reconnect())
@@ -124,7 +124,7 @@ class AsyncIpcClient:
             if self.connected:
                 await self.ws.send(dumps(message_object))
         except (websockets.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK) as e:
-            #print(f"Connection Closed Error in client _send: {e}")
+            print(f"Connection Closed Error in client _send: {e}")
             pass  # if Connection error happens reconnecting with listen
         except KeyError as e:
             print(f"Key Error in client _send: {e}")
@@ -144,10 +144,7 @@ class AsyncIpcServer:
         return not self.ws.closed
 
     async def disconnect(self):
-        print("dis connectiong")
-        await asyncio.sleep(5)
         await self.ws.close()
-        print("disconnected")
 
     async def listen(self):
         try:
