@@ -68,9 +68,13 @@ class AsyncIpcClient:
         return self.ws.open
 
     async def connect(self):
-        self.ws = await websockets.connect(f'ws://{self._host}:{self._port}', max_size=MAX_SIZE, ping_interval=None)
-        if not self._listen_task:
-            self._listen_task = asyncio.create_task(self.listen())
+        try:
+            self.ws = await websockets.connect(f'ws://{self._host}:{self._port}', max_size=MAX_SIZE, ping_interval=None)
+            if not self._listen_task:
+                self._listen_task = asyncio.create_task(self.listen())
+            return True
+        except Exception as e:
+            print("Exception in connect", e)
 
     async def _resend_tasks(self):
         task: asyncio.Future
@@ -82,8 +86,8 @@ class AsyncIpcClient:
     async def _reconnect(self):
         print("reconnecting")
         await self.disconnect()
-        await self.connect()
-        await self._resend_tasks()
+        if await self.connect():
+            await self._resend_tasks()
 
     async def disconnect(self):
         if self._listen_task and self._listen_task.done():
@@ -124,7 +128,7 @@ class AsyncIpcClient:
             if self.connected:
                 await self.ws.send(dumps(message_object))
         except (websockets.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK) as e:
-            print(f"Connection Closed Error in client _send: {e}")
+            #print(f"Connection Closed Error in client _send: {e}")
             pass  # if Connection error happens reconnecting with listen
         except KeyError as e:
             print(f"Key Error in client _send: {e}")
