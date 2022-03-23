@@ -25,6 +25,7 @@ class MyClass:
         return self._secret_value
 
 
+
 my_class = MyClass()
 
 
