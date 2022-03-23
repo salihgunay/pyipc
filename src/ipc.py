@@ -2,22 +2,42 @@ import asyncio
 import websockets
 from itertools import count
 from pickle import loads, dumps
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Callable
+from socket import gethostbyname, gaierror
+import sys
+import lzma
 
 MAX_MSG_ID = 2 ** 32
 MAX_SIZE = 1_000_000_000
-PING_INTERVAL = 10
+RECONNECT_MAX_TIME = 5 * 60  # Try 5 mins apart connecting
+IPC_TIMEOUT = 1000  # Interprocess call timeout in seconds
+RPC_TIMEOUT = 40  # Remote process call timeout in seconds
+MB_MULTIPLIER = 1 / (1024 * 1024)  # This value will multiply with raw upload and download size to change in MB
+
+
+def is_localhost(host: str):
+    return host == '::1' or gethostbyname(host) == '127.0.0.1'
+
+
+class ConnectionNotExist(Exception):
+    pass
 
 
 class MessageObject:
-    def __init__(self, function_name_: str, message_id_: int, *args, is_client_calling_: bool = True, **kwargs):
-        self._function_name = function_name_
-        self._message_id = message_id_
+    def __init__(self, function_name: str, message_id: int, args: Tuple, kwargs: Dict, notify: bool = False,
+                 sender: str = '', receiver: str = '', timeout: int = None):
+        self._function_name = function_name
+        self._message_id = message_id
         self._args = args
         self._kwargs = kwargs
         self._result = None
         self._error = False
-        self._is_client_calling = is_client_calling_
+        self._sender = sender
+        self._receiver = receiver
+        self._reversed_direction: bool = False
+        self._owner = sender
+        self._notify: bool = notify
+        self._timeout: int = timeout
 
     @property
     def function_name(self):
@@ -34,6 +54,11 @@ class MessageObject:
     @result.setter
     def result(self, result):
         self._result = result
+        self._remove_redundant_data()
+
+    def _remove_redundant_data(self):
+        self._args = None
+        self._kwargs = None
 
     @property
     def args(self) -> Tuple:
@@ -52,19 +77,103 @@ class MessageObject:
         self._error = error
 
     @property
-    def is_client_calling(self):
-        return self._is_client_calling
+    def sender(self) -> str:
+        return self._sender
+
+    @property
+    def receiver(self) -> str:
+        return self._receiver
+
+    @property
+    def reversed_direction(self) -> bool:
+        return self._reversed_direction
+
+    @property
+    def owner(self) -> str:
+        return self._owner
+
+    @property
+    def notify(self) -> bool:
+        return self._notify
+
+    @property
+    def timeout(self) -> int:
+        return self._timeout
+
+    def __str__(self):
+        return f'def {self.function_name}{len(self.args), self.kwargs.keys()} -> {self.result}:\n\t# Message ID: ' \
+               f'{self.owner} - {self.message_id}\n\t# Error: {self.error}\n\t# Sender: {self.sender}\n\t# Receiver: ' \
+               f'{self.receiver}\n\t# Reversed direction: {self.reversed_direction}\n\t# Notify: {self.notify}'
+
+    def reverse_direction(self):
+        temp = self._sender
+        self._sender = self._receiver
+        self._receiver = temp
+        self._reversed_direction = True
 
 
-class IpcBase:
-    def __init__(self, klass=None, ws=None):
-        self.klass = klass
+class AsyncIpcBase:
+    def __init__(self, host: str, connection_lost_callback: Callable = None, connection_made_callback: Callable = None):
+        self._connection_lost_callback = connection_lost_callback
+        self._connection_made_callback = connection_made_callback
+        self._is_localhost = is_localhost(host)  # Is connection between localhost or remote
+        self._upload = 0  # Size in mb
+        self._download = 0  # Size in mb
+
+    @property
+    def compress(self) -> bool:
+        return self._is_localhost
+
+    @property
+    def upload(self) -> float:
+        return self._upload
+
+    @property
+    def download(self) -> float:
+        return self._download
+
+    def _add_upload(self, size: int):
+        self._upload += size * MB_MULTIPLIER
+
+    def _add_download(self, size: int):
+        self._download += size * MB_MULTIPLIER
+
+    def _call_connection_lost_callback(self):
+        if asyncio.iscoroutinefunction(self._connection_lost_callback):
+            asyncio.ensure_future(self._connection_lost_callback())
+        elif callable(self._connection_lost_callback):
+            self._connection_lost_callback()
+
+    def _call_connection_made_callback(self):
+        if asyncio.iscoroutinefunction(self._connection_made_callback):
+            asyncio.ensure_future(self._connection_made_callback())
+        elif callable(self._connection_made_callback):
+            self._connection_made_callback()
+
+
+class AsyncIpcClient(AsyncIpcBase):
+    _listen_task = None
+    _reconnect_delay = 0
+
+    def __init__(self, host: str = 'localhost', port: int = 8765, client_name: str = '', server_name: str = '',
+                 connection_made_callback=None, connection_lost_callback=None, reconnect: bool = False,
+                 resend: bool = False, ssl_context=None):
+
+        super().__init__(host,
+                         connection_lost_callback=connection_lost_callback,
+                         connection_made_callback=connection_made_callback)
+        self._host = host
+        self._port = port
+        self._iter = count()
         self.tasks: [Dict, asyncio.Future] = {}
-        self.ws = ws
-        if not (isinstance(self, AsyncIpcClient) or isinstance(self, AsyncIpcServer)):
-            raise Exception('Ipc Client or Ipc Server expected')
-
-        self._am_i_ipc_client = isinstance(self, AsyncIpcClient)
+        self.proxy = Proxy(self._send, client_name, server_name)
+        self.client_name = client_name
+        self.server_name = server_name
+        self.ws = None
+        self._should_reconnect = reconnect
+        self._should_resend = resend
+        self._ssl_context = ssl_context
+        self._timeout = IPC_TIMEOUT if self._is_localhost else RPC_TIMEOUT
 
     @property
     def connected(self) -> bool:
@@ -73,151 +182,241 @@ class IpcBase:
         return False
 
     @property
-    def name(self) -> str:
-        return 'client' if self._am_i_ipc_client else 'server'
+    def timeout(self) -> int:
+        return self._timeout
 
-    async def listen(self):
+    @property
+    def should_reconnect(self) -> bool:
+        return self._should_reconnect
+
+    @should_reconnect.setter
+    def should_reconnect(self, should_reconnect: bool):
+        self._should_reconnect = should_reconnect
+
+    async def connect(self, should_reconnect: bool = None):
+        if isinstance(should_reconnect, bool):
+            self._should_reconnect = should_reconnect
         try:
-            async for message in self.ws:
-                message_object: MessageObject = loads(message)
-                asyncio.ensure_future(self._on_message(message_object))
-        except websockets.ConnectionClosedError as e:
-            print(f"Connection Closed Error in {self.name} _listen: {e}, {self.connected}")
+            uri = f'ws{"s" if self._ssl_context else ""}://{self._host}:{self._port}'
+            self.ws = await websockets.connect(uri, max_size=MAX_SIZE, ssl=self._ssl_context)
+            if not self._listen_task:
+                self._listen_task = asyncio.create_task(self.listen())
+            self._call_connection_made_callback()
+        except (ConnectionRefusedError, gaierror, websockets.exceptions.InvalidMessage, ConnectionResetError):
+            if self._should_reconnect:
+                asyncio.ensure_future(self._reconnect())
         except Exception as e:
-            print(f"Other Exception in {self.name} _listen: {e}")
-
-    async def _on_message(self, message_object: MessageObject):
-        if (message_object.is_client_calling and self._am_i_ipc_client) or \
-                (not message_object.is_client_calling and not self._am_i_ipc_client):
-            future, message_object_ = self.tasks.pop(message_object.message_id)
-            if future.done():
-                return
-
-            if message_object.error:
-                future.set_exception(message_object.result)
-            else:
-                future.set_result(message_object.result)
-        else:
-            result = None
-            try:
-                func = getattr(self.klass, message_object.function_name)
-                result = await func(*message_object.args, **message_object.kwargs) if \
-                    asyncio.iscoroutinefunction(func) else func(*message_object.args, **message_object.kwargs)
-            except Exception as e:
-                message_object.error = True
-                result = e
-            finally:
-                message_object.result = result
-            try:
-                if self.connected:
-                    await self.ws.send(dumps(message_object))
-            except (websockets.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK) as e:
-                print(f"{self.name} _on_message {e}")
-                pass  # Connection lost, delete instance and wait for another connection
-
-    async def _send(self, message_object: MessageObject):
-        future = asyncio.Future()
-        try:
-            self.tasks[message_object.message_id] = (future, message_object)
-            if self.connected:
-                await self.ws.send(dumps(message_object))
-        except (websockets.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK) as e:
-            # print(f"Connection Closed Error in client _send: {e}")
-            pass  # if Connection error happens reconnecting with listen
-        except KeyError as e:
-            print(f"Key Error in {self.name} _send: {e}")
-        except Exception as e:
-            print(f"Other Exception in {self.name} _send: {e}")
-        return await future
-
-
-class AsyncIpcClient(IpcBase):
-
-    def __init__(self, host: str = 'localhost', port: int = 8765, resending: bool = True, klass=None,
-                 connection_lost_callback=None):
-        super().__init__(klass=klass)
-        self._host = host
-        self._port = port
-        self.server = Proxy(self._send, is_client_proxy=True)
-        self._connection_lost_callback = connection_lost_callback
-        self._listen_task = None
-        self._resending = resending  # Should client try to resend tasks
-
-    async def connect(self):
-        self.ws = await websockets.connect(f'ws://{self._host}:{self._port}', max_size=MAX_SIZE, ping_interval=None)
-        if not self._listen_task:
-            self._listen_task = asyncio.create_task(self.listen())
+            print("connect new error happened. add this to upper except")
+            print(e, type(e))
+            if self._should_reconnect:
+                asyncio.ensure_future(self._reconnect())
 
     async def _resend_tasks(self):
         task: asyncio.Future
         message_object: MessageObject
-        print(f"resending {len(self.tasks)} tasks.")
+        print(f"resending {len(self.tasks)} tasks. Client: {self.client_name} - Server: {self.server_name}")
         for task, message_object in self.tasks.values():
             await self.ws.send(dumps(message_object))
 
-    def _cancel_tasks(self):
+    def _clear_tasks(self):
         task: asyncio.Future
         message_object: MessageObject
-        print(f"canceling {len(self.tasks)} tasks.")
-        exception = Exception("Tasks cancelled because connection closed")
         for task, message_object in self.tasks.values():
-            task.set_exception(exception)
-        self.tasks = {}
+            print("Canceling\n", message_object)
+            task.set_exception(ConnectionNotExist)
+        self.tasks.clear()
+        self.proxy.reset_count()
 
     async def _reconnect(self):
-        print(f"reconnecting.")
+        # print(f"Sleeping {self._reconnect_delay} then reconnecting. Client: {self.client_name} - Server: {self.server_name}")
+        await asyncio.sleep(self._reconnect_delay)
         await self.disconnect()
-        # First of all cancel all tasks and clear list
-        if not self._resending:
-            self._cancel_tasks()
         await self.connect()
-        if self._resending:
-            await self._resend_tasks()
+        if self.connected:
+            if self._should_resend:
+                await self._resend_tasks()
+            else:
+                self._clear_tasks()
+        self._calculate_reconnect_delay()
+
+    def _calculate_reconnect_delay(self):
+        if self.connected:
+            self._reconnect_delay = 0
         else:
-            self._cancel_tasks()
+            self._reconnect_delay = min(5 + self._reconnect_delay * 1.5, RECONNECT_MAX_TIME)
 
-    async def disconnect(self):
-        if self._listen_task and self._listen_task.done():
+    async def disconnect(self, should_reconnect: bool = None):
+        if isinstance(should_reconnect, bool):  # This is like force quit connecting
+            self._should_reconnect = should_reconnect
+
+        if self._listen_task:
+            if not self._listen_task.done():
+                self._listen_task.cancel()
             self._listen_task = None
-        if self.ws.open:
+        if self.ws and self.ws.open:
             await self.ws.close()
-
-        if asyncio.iscoroutinefunction(self._connection_lost_callback):
-            await self._connection_lost_callback()
-        elif callable(self._connection_lost_callback):
-            self._connection_lost_callback()
+            self._call_connection_lost_callback()
 
     async def listen(self):
-        await super().listen()
-        asyncio.ensure_future(self._reconnect())
+        try:
+            async for message in self.ws:
+                message_object: MessageObject
+                if not self._is_localhost:
+                    self._add_download(sys.getsizeof(message))
+                    message_object = loads(lzma.decompress(message))
+                else:
+                    message_object = loads(message)
+                asyncio.ensure_future(self._on_message(message_object))
+        except websockets.ConnectionClosedError:
+            #print(f"Connection Closed Error in client _listen. Client: {self.client_name} - Server: {self.server_name}")
+            pass
+        except Exception as e:
+            print(f"Other Exception in client _listen: {e}. Client: {self.client_name} - Server: {self.server_name}")
+        if not self._should_resend:
+            self._clear_tasks()
+        self._call_connection_lost_callback()
+
+        if self._should_reconnect:
+            asyncio.ensure_future(self._reconnect())
+
+    def _remove_task(self, task_id: int) -> Tuple[asyncio.Future, MessageObject]:
+        if self.tasks.get(task_id):
+            return self.tasks.pop(task_id)
+
+    def _add_task(self, task: asyncio.Future, message_object: MessageObject):
+        self.tasks[message_object.message_id] = (task, message_object)
+
+    async def _on_message(self, message_object: MessageObject):
+        result: [asyncio.Future, MessageObject] = self._remove_task(message_object.message_id)
+        if result:
+            if message_object.error:
+                result[0].set_exception(message_object.result)
+            else:
+                result[0].set_result(message_object.result)
+
+    async def _send(self, message_object: MessageObject):
+        future = asyncio.Future()
+        if not message_object.notify:
+            self._add_task(future, message_object)
+        try:
+            if not self._is_localhost:
+                message = lzma.compress(dumps(message_object))
+            else:
+                message = dumps(message_object)
+            await self.ws.send(message)
+            if not self._is_localhost:
+                self._add_upload(sys.getsizeof(message))
+        except (websockets.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK):
+            # print(f"Connection Closed Error in client _send: {e}")
+            pass  # if Connection error happens reconnecting with listen
+        except KeyError as e:
+            print(f"Key Error in client _send: {e}")
+        except Exception as e:
+            print(f"Other Exception in client _send: {e}")
+        if message_object.notify:
+            future.cancel()
+        else:
+            try:
+                # If message object has timeout use it else use standard timeout
+                timeout = message_object.timeout or self._timeout
+                return await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError:
+                print("Timeout error happened", message_object)
+                self._remove_task(message_object.message_id)
 
 
-class AsyncIpcServer(IpcBase):
+class AsyncIpcServer(AsyncIpcBase):
 
-    def __init__(self, klass, ws):
-        super().__init__(klass=klass, ws=ws)
-        self.client = Proxy(self._send, is_client_proxy=False)
+    def __init__(self, klass, ws, connection_lost_callback=None, server_name: str = None):
+        super().__init__(ws.remote_address[0], connection_lost_callback=connection_lost_callback)
+        self.ws = ws
+        self.klass = klass
+        self.server_name = server_name
+
+    @property
+    def connected(self) -> bool:
+        return not self.ws.closed
 
     async def disconnect(self):
         await self.ws.close()
 
+    async def listen(self):
+        try:
+            async for message in self.ws:
+                message_object: MessageObject
+                if not self._is_localhost:
+                    self._add_download(sys.getsizeof(message))
+                    message_object = loads(lzma.decompress(message))
+                else:
+                    message_object = loads(message)
+                asyncio.ensure_future(self._on_message(message_object))
+        except websockets.ConnectionClosedError:
+            #print(f"Connection Closed Error in server _listen. Server: {self.server_name}")
+            pass
+        except Exception as e:
+            print(f"Other Exception in server listen: {e}. Server: {self.server_name}")
+        self._call_connection_lost_callback()
+
+    async def _on_message(self, message_object: MessageObject):
+        result = None
+        try:
+            func = getattr(self.klass, message_object.function_name)
+            result = await func(*message_object.args, **message_object.kwargs) if \
+                asyncio.iscoroutinefunction(func) else func(*message_object.args, **message_object.kwargs)
+        except Exception as e:
+            message_object.error = True
+            result = e
+        finally:
+            message_object.result = result
+            message_object.reverse_direction()
+        try:
+            if not message_object.notify:
+                await self._send(message_object)
+
+        except (websockets.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK) as e:
+            print(f"server _on_message {e}. Server: {self.server_name}")
+            pass  # Connection lost, delete instance and wait for another connection
+
+    async def _send(self, message_object: MessageObject):
+        if not self._is_localhost:
+            message = lzma.compress(dumps(message_object))
+        else:
+            message = dumps(message_object)
+        await self.ws.send(message)
+        if not self._is_localhost:
+            self._add_upload(sys.getsizeof(message))
+        #print(f'Sent bytes: {len(raw_message)}')
+
 
 class Proxy:
-    def __init__(self, send, is_client_proxy: bool = True):
+    def __init__(self, send: Callable, sender: str = '', receiver: str = ''):
         self._send = send
         self._iter = count()
-        self._is_client_proxy = is_client_proxy
+        self._sender = sender
+        self._receiver = receiver
 
     @property
     def _next_message_id(self) -> int:
         message_id = next(self._iter)
         if message_id > MAX_MSG_ID:
-            self._iter = count()
+            self.reset_count()
         return message_id
 
-    def __getattr__(self, function_name_):
+    def __getattr__(self, function_name):
         async def func(*args, **kwargs):
-            message_object = MessageObject(function_name_, self._next_message_id, *args,
-                                           is_client_calling_=self._is_client_proxy, **kwargs)
+            notify = False
+            if kwargs.get('notify'):
+                notify = kwargs.pop('notify')
+
+            timeout = None
+            if kwargs.get('timeout'):
+                timeout = kwargs.pop('timeout')
+
+            message_object = MessageObject(function_name=function_name, message_id=self._next_message_id, notify=notify,
+                                           sender=self._sender, receiver=self._receiver, timeout=timeout, args=args,
+                                           kwargs=kwargs)
             return await self._send(message_object)
         return func
+
+    def reset_count(self):
+        self._iter = count()
