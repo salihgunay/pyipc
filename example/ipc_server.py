@@ -2,6 +2,7 @@ import asyncio
 import websockets
 from src.ipc import AsyncIpcServer, MAX_SIZE
 import uvloop  # Optional
+import random
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
@@ -31,8 +32,10 @@ server_class = ServerClass()
 async def echo(websocket, _):
     ipc_server = AsyncIpcServer(server_class, websocket)
     task = asyncio.create_task(ipc_server.listen())
-    for i in range(2500):
-        print(await ipc_server.proxy.multiply(i, i/2))
+    for i in range(2000):
+        jobs = [ipc_server.proxy.multiply(random.random(), i / 2) for i in range(10_000)]
+        res = await asyncio.gather(*jobs)
+        print(res)
     await asyncio.sleep(10)
 
 

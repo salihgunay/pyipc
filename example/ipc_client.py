@@ -1,4 +1,6 @@
 import asyncio
+import random
+
 from src.ipc import AsyncIpcClient
 import uvloop  # Optional
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -14,8 +16,11 @@ class ClientClass:
         ipc_client = AsyncIpcClient(self)
         await ipc_client.connect()
         self.server_class = ipc_client.proxy  # Get class instance proxy
-        for i in range(2500):
-            print(await self.server_class.sum(i, i/2, hello="world", val=5, paradise="comes"))
+        for i in range(2000):
+            jobs = [self.server_class.sum(random.random(), i / 2) for i in range(10_000)]
+            res = await asyncio.gather(*jobs)
+            print(res)
+
         # This will not be here, event loop will take care of run forever
         await asyncio.sleep(100)
 

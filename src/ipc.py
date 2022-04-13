@@ -118,11 +118,13 @@ class MessageObject:
 
 class AsyncIpcBase:
     ws: [WebSocketServerProtocol, WebSocketClientProtocol] = None
-    am_i_server = None  # This must be assigned
 
-    def __init__(self, host: str, connection_lost_callback: Callable = None, connection_made_callback: Callable = None,
+    def __init__(self, klass, host: str, connection_lost_callback: Callable = None, connection_made_callback: Callable = None,
                  client_name: str = '', server_name: str = ''):
+        self.klass = klass
         self.tasks: [Dict, asyncio.Future] = {}
+        self.server_name = server_name
+        self.client_name = client_name
         self.proxy = Proxy(self._send, client_name, server_name)
         self._connection_lost_callback = connection_lost_callback
         self._connection_made_callback = connection_made_callback
@@ -130,6 +132,16 @@ class AsyncIpcBase:
         self._timeout = IPC_TIMEOUT if self._is_localhost else RPC_TIMEOUT
         self._upload = 0  # Size in mb
         self._download = 0  # Size in mb
+
+    @property
+    def connected(self) -> bool:
+        if self.ws:
+            return self.ws.open
+        return False
+
+    @property
+    def timeout(self) -> int:
+        return self._timeout
 
     @property
     def compress(self) -> bool:
@@ -212,7 +224,6 @@ class AsyncIpcBase:
             try:
                 if not message_object.notify:
                     await self._send(message_object)
-
             except (ConnectionClosedError, ConnectionClosedOK) as e:
                 print(f"server _on_message {e}. Server: {self.server_name}")
                 pass  # Connection lost, delete instance and wait for another connection
@@ -272,26 +283,14 @@ class AsyncIpcClient(AsyncIpcBase):
     def __init__(self, klass, host: str = 'localhost', port: int = 8765, client_name: str = '', server_name: str = '',
                  connection_made_callback=None, connection_lost_callback=None, reconnect: bool = False,
                  resend: bool = False, ssl_context=None):
-        super().__init__(host, connection_lost_callback=connection_lost_callback, connection_made_callback=connection_made_callback,
+        super().__init__(klass, host, connection_lost_callback=connection_lost_callback, connection_made_callback=connection_made_callback,
                          client_name=client_name, server_name=server_name)
-        self.klass = klass
         self._host = host
         self._port = port
         self.ws = None
         self._should_reconnect = reconnect
         self._should_resend = resend
         self._ssl_context = ssl_context
-        self.am_i_server = False
-
-    @property
-    def connected(self) -> bool:
-        if self.ws:
-            return self.ws.open
-        return False
-
-    @property
-    def timeout(self) -> int:
-        return self._timeout
 
     @property
     def should_reconnect(self) -> bool:
@@ -354,33 +353,25 @@ class AsyncIpcClient(AsyncIpcBase):
             self._reconnect_delay = min(5 + self._reconnect_delay * 1.5, RECONNECT_MAX_TIME)
 
     async def disconnect(self, should_reconnect: bool = None):
-        if isinstance(should_reconnect, bool):  # This is like force quit connecting
-            self._should_reconnect = should_reconnect
+        if isinstance(self, AsyncIpcClient):
+            if isinstance(should_reconnect, bool):  # This is like force quit connecting
+                self._should_reconnect = should_reconnect
 
-        if self._listen_task:
-            if not self._listen_task.done():
-                self._listen_task.cancel()
-            self._listen_task = None
+            if self._listen_task:
+                if not self._listen_task.done():
+                    self._listen_task.cancel()
+                self._listen_task = None
+
         if self.ws and self.ws.open:
             await self.ws.close()
             self._call_connection_lost_callback()
 
 
 class AsyncIpcServer(AsyncIpcBase):
-
-    def __init__(self, klass, ws, connection_lost_callback=None, server_name: str = None):
-        super().__init__(ws.remote_address[0], connection_lost_callback=connection_lost_callback)
+    def __init__(self, klass, ws, connection_lost_callback=None, server_name: str = '', client_name: str = ''):
+        super().__init__(klass, ws.remote_address[0], connection_lost_callback=connection_lost_callback,
+                         server_name=server_name, client_name=client_name)
         self.ws = ws
-        self.klass = klass
-        self.server_name = server_name
-        self.am_i_server = True
-
-    @property
-    def connected(self) -> bool:
-        return not self.ws.closed
-
-    async def disconnect(self):
-        await self.ws.close()
 
 
 class Proxy:
