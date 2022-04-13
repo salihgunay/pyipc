@@ -173,6 +173,12 @@ class AsyncIpcBase:
         elif callable(self._connection_made_callback):
             self._connection_made_callback()
 
+    async def connection_lost(self):
+        raise NotImplementedError()
+
+    async def connection_made(self):
+        raise NotImplementedError()
+
     async def listen(self):
         """
         This function behaves same when receiving data but different when acting to exceptions
@@ -190,25 +196,15 @@ class AsyncIpcBase:
             # print(f"Connection Closed Error in server _listen. Server: {self.server_name}")
             pass
         except Exception as e:
-            if self.am_i_server:  # If server
-                print(f"Other Exception in server listen: {e}. Server: {self.server_name}")
-                self._call_connection_lost_callback()
-            else:
-                print(f"Other Exception in client listen: {e}. Client: {self.client_name}")
-                if not self._should_resend:
-                    self._clear_tasks()
-                self._call_connection_lost_callback()
-                if self._should_reconnect:
-                    asyncio.ensure_future(self._reconnect())
+            print(f"Other Exception in listen: {e}. Server: {self.server_name} Client: {self.client_name}")
+        finally:
+            asyncio.ensure_future(self.connection_lost())
 
     async def _on_message(self, message_object: MessageObject):
         if message_object.reversed_direction:  # If reversed direction simply set the result
             result: [asyncio.Future, MessageObject] = self._remove_task(message_object.message_id)
-            if result:
-                if message_object.error:
-                    result[0].set_exception(message_object.result)
-                else:
-                    result[0].set_result(message_object.result)
+            if result and not result[0].cancelled():
+                result[0].set_exception(message_object.result) if message_object.error else result[0].set_result(message_object.result)
         else:
             result = None
             try:
@@ -308,7 +304,7 @@ class AsyncIpcClient(AsyncIpcBase):
             self.ws = await connect(uri, max_size=MAX_SIZE, ssl=self._ssl_context)
             if not self._listen_task:
                 self._listen_task = asyncio.create_task(self.listen())
-            self._call_connection_made_callback()
+            asyncio.ensure_future(self.connection_made())
         except (ConnectionRefusedError, gaierror, InvalidMessage, ConnectionResetError):
             if self._should_reconnect:
                 asyncio.ensure_future(self._reconnect())
@@ -329,8 +325,8 @@ class AsyncIpcClient(AsyncIpcBase):
         task: asyncio.Future
         message_object: MessageObject
         for task, message_object in self.tasks.values():
-            print("Canceling\n", message_object)
-            task.set_exception(ConnectionNotExist)
+            # print("Canceling\n", message_object)
+            task.set_exception(ConnectionNotExist())
         self.tasks.clear()
         self.proxy.reset_count()
 
@@ -366,12 +362,28 @@ class AsyncIpcClient(AsyncIpcBase):
             await self.ws.close()
             self._call_connection_lost_callback()
 
+    async def connection_lost(self):
+        if not self._should_resend:
+            self._clear_tasks()
+        self._call_connection_lost_callback()
+        if self._should_reconnect:
+            asyncio.ensure_future(self._reconnect())
+
+    async def connection_made(self):
+        self._call_connection_made_callback()
+
 
 class AsyncIpcServer(AsyncIpcBase):
     def __init__(self, klass, ws, connection_lost_callback=None, server_name: str = '', client_name: str = ''):
         super().__init__(klass, ws.remote_address[0], connection_lost_callback=connection_lost_callback,
                          server_name=server_name, client_name=client_name)
         self.ws = ws
+
+    async def connection_lost(self):
+        self._call_connection_lost_callback()
+
+    async def connection_made(self):
+        self._call_connection_made_callback()
 
 
 class Proxy:
