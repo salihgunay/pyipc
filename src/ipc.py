@@ -6,20 +6,20 @@ from websockets.server import WebSocketServerProtocol
 from itertools import count
 from pickle import loads, dumps
 from typing import Dict, Tuple, Callable
-from socket import gethostbyname, gaierror
+from socket import gaierror
 import sys
 import lzma
 
 MAX_MSG_ID = 2 ** 32
 MAX_SIZE = 1_000_000_000
-RECONNECT_MAX_TIME = 5 * 60  # Try 5 mins apart connecting
+RECONNECT_MAX_TIME = 30  # Try 30 seconds to reconnect max
 IPC_TIMEOUT = 1000  # Interprocess call timeout in seconds
 RPC_TIMEOUT = 40  # Remote process call timeout in seconds
 MB_MULTIPLIER = 1 / (1024 * 1024)  # This value will multiply with raw upload and download size to change in MB
 
 
 def is_localhost(host: str):
-    return host == '::1' or gethostbyname(host) == '127.0.0.1'
+    return host == '::1' or host == '127.0.0.1' or host == 'localhost'
 
 
 class ConnectionNotExist(Exception):
@@ -247,7 +247,7 @@ class AsyncIpcBase:
                 if not self._is_localhost:
                     self._add_upload(sys.getsizeof(message))
             except (ConnectionClosedError, ConnectionClosedOK):
-                # print(f"Connection Closed Error in client _send: {e}")
+                print(f"Connection Closed Error in client _send:")
                 pass  # if Connection error happens reconnecting with listen
             except KeyError as e:
                 print(f"Key Error in client _send: {e}")
@@ -270,6 +270,20 @@ class AsyncIpcBase:
 
     def _add_task(self, task: asyncio.Future, message_object: MessageObject):
         self.tasks[message_object.message_id] = (task, message_object)
+
+    async def disconnect(self, should_reconnect: bool = None):
+        if isinstance(self, AsyncIpcClient):
+            if isinstance(should_reconnect, bool):  # This is like force quit connecting
+                self._should_reconnect = should_reconnect
+
+            if self._listen_task:
+                if not self._listen_task.done():
+                    self._listen_task.cancel()
+                self._listen_task = None
+
+        if self.ws and self.ws.open:
+            await self.ws.close()
+            self._call_connection_lost_callback()
 
 
 class AsyncIpcClient(AsyncIpcBase):
@@ -305,8 +319,9 @@ class AsyncIpcClient(AsyncIpcBase):
             if not self._listen_task:
                 self._listen_task = asyncio.create_task(self.listen())
             asyncio.ensure_future(self.connection_made())
-        except (ConnectionRefusedError, gaierror, InvalidMessage, ConnectionResetError):
+        except (ConnectionRefusedError, gaierror, InvalidMessage, ConnectionResetError, ConnectionAbortedError, TimeoutError):
             if self._should_reconnect:
+                # print("auto reconnecting")
                 asyncio.ensure_future(self._reconnect())
         except Exception as e:
             print("connect new error happened. add this to upper except")
@@ -346,21 +361,7 @@ class AsyncIpcClient(AsyncIpcBase):
         if self.connected:
             self._reconnect_delay = 0
         else:
-            self._reconnect_delay = min(5 + self._reconnect_delay * 1.5, RECONNECT_MAX_TIME)
-
-    async def disconnect(self, should_reconnect: bool = None):
-        if isinstance(self, AsyncIpcClient):
-            if isinstance(should_reconnect, bool):  # This is like force quit connecting
-                self._should_reconnect = should_reconnect
-
-            if self._listen_task:
-                if not self._listen_task.done():
-                    self._listen_task.cancel()
-                self._listen_task = None
-
-        if self.ws and self.ws.open:
-            await self.ws.close()
-            self._call_connection_lost_callback()
+            self._reconnect_delay = min(1 + self._reconnect_delay * 1.2, RECONNECT_MAX_TIME)
 
     async def connection_lost(self):
         if not self._should_resend:

@@ -16,13 +16,13 @@ class ClientClass:
         ipc_client = AsyncIpcClient(self)
         await ipc_client.connect()
         self.server_class = ipc_client.proxy  # Get class instance proxy
-        for i in range(2000):
-            jobs = [self.server_class.sum(random.random(), i / 2) for i in range(10_000)]
+        for i in range(2):
+            jobs = [self.server_class.sum(random.random(), i / 2) for i in range(1_000)]
             res = await asyncio.gather(*jobs)
             print(res)
 
         # This will not be here, event loop will take care of run forever
-        await asyncio.sleep(100)
+        #await asyncio.sleep(100)
 
     @staticmethod
     def reverse_echo_from_server(sentence: str) -> str:
