@@ -277,7 +277,6 @@ class AsyncIpcBase:
 
 
 class AsyncIpcClient(AsyncIpcBase):
-    _listen_task = None
     _reconnect_delay = 0
 
     def __init__(self, klass, host: str = 'localhost', port: int = 8765, client_name: str = '', server_name: str = '',
@@ -302,6 +301,7 @@ class AsyncIpcClient(AsyncIpcBase):
             try:
                 self.ws = ws
                 self._wait_until_connected_future.set_result(True)
+                self._calculate_reconnect_delay()
                 asyncio.ensure_future(self.connection_made())
                 if self.resend:
                     asyncio.ensure_future(self._resend_tasks())
@@ -313,7 +313,8 @@ class AsyncIpcClient(AsyncIpcBase):
                 print("connect new error happened. add this to upper except")
                 print(e, type(e))
             finally:
-                self._wait_until_connected_future = asyncio.Future()
+                if self._wait_until_connected_future.done():
+                    self._wait_until_connected_future = asyncio.Future()
                 if self.reconnect is False:  # exit if reconnect is disabled
                     break
 
