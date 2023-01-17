@@ -1,6 +1,6 @@
 import asyncio
-from websockets import connect, ConnectionClosedError
-from websockets.exceptions import InvalidMessage, ConnectionClosedOK
+from websockets.legacy.client import connect
+from websockets.exceptions import InvalidMessage, ConnectionClosedOK, ConnectionClosedError
 from websockets.client import WebSocketClientProtocol
 from websockets.server import WebSocketServerProtocol
 from itertools import count
@@ -16,6 +16,7 @@ RECONNECT_MAX_TIME = 30  # Try 30 seconds to reconnect max
 IPC_TIMEOUT = 1000  # Interprocess call timeout in seconds
 RPC_TIMEOUT = 40  # Remote process call timeout in seconds
 MB_MULTIPLIER = 1 / (1024 * 1024)  # This value will multiply with raw upload and download size to change in MB
+connect.BACKOFF_MAX = 15
 
 
 def is_localhost(host: str):
@@ -181,7 +182,7 @@ class AsyncIpcBase:
 
     async def listen(self):
         """
-        This function behaves same when receiving data but different when acting to exceptions
+        This function listens to new messages until connection closed
         """
         try:
             async for message in self.ws:
@@ -192,11 +193,6 @@ class AsyncIpcBase:
                 else:
                     message_object = loads(message)
                 asyncio.ensure_future(self._on_message(message_object))
-        except ConnectionClosedError:
-            # print(f"Connection Closed Error in server _listen. Server: {self.server_name}")
-            pass
-        except Exception as e:
-            print(f"Other Exception in listen: {e}. Server: {self.server_name} Client: {self.client_name}")
         finally:
             asyncio.ensure_future(self.connection_lost())
 
@@ -271,19 +267,13 @@ class AsyncIpcBase:
     def _add_task(self, task: asyncio.Future, message_object: MessageObject):
         self.tasks[message_object.message_id] = (task, message_object)
 
-    async def disconnect(self, should_reconnect: bool = None):
-        if isinstance(self, AsyncIpcClient):
-            if isinstance(should_reconnect, bool):  # This is like force quit connecting
-                self._should_reconnect = should_reconnect
-
-            if self._listen_task:
-                if not self._listen_task.done():
-                    self._listen_task.cancel()
-                self._listen_task = None
-
+    async def disconnect(self):
+        """
+        If this function called in client and reconnect is active, it will try to reconnect
+        so if you want to disconnect completely first deactivate reconnect flag than disconnect
+        """
         if self.ws and self.ws.open:
-            await self.ws.close()
-            self._call_connection_lost_callback()
+            await self.ws.close(code=1000, reason='User disconnected connection')
 
 
 class AsyncIpcClient(AsyncIpcBase):
@@ -298,36 +288,41 @@ class AsyncIpcClient(AsyncIpcBase):
         self._host = host
         self._port = port
         self.ws = None
-        self._should_reconnect = reconnect
-        self._should_resend = resend
+        self.reconnect = reconnect
+        self.resend = resend
         self._ssl_context = ssl_context
+        self._wait_until_connected_future = asyncio.Future()
 
-    @property
-    def should_reconnect(self) -> bool:
-        return self._should_reconnect
+    async def connect(self):
+        """
+        This is a blocking call, so ensure future when calling this function
+        """
+        uri = f'ws{"s" if self._ssl_context else ""}://{self._host}:{self._port}'
+        async for ws in connect(uri, max_size=MAX_SIZE, ssl=self._ssl_context):
+            try:
+                self.ws = ws
+                self._wait_until_connected_future.set_result(True)
+                asyncio.ensure_future(self.connection_made())
+                if self.resend:
+                    asyncio.ensure_future(self._resend_tasks())
+                await self.listen()
+            except (ConnectionRefusedError, gaierror, InvalidMessage, ConnectionResetError, ConnectionAbortedError, TimeoutError,
+                    ConnectionClosedError):
+                pass
+            except Exception as e:
+                print("connect new error happened. add this to upper except")
+                print(e, type(e))
+            finally:
+                self._wait_until_connected_future = asyncio.Future()
+                if self.reconnect is False:  # exit if reconnect is disabled
+                    break
 
-    @should_reconnect.setter
-    def should_reconnect(self, should_reconnect: bool):
-        self._should_reconnect = should_reconnect
-
-    async def connect(self, should_reconnect: bool = None):
-        if isinstance(should_reconnect, bool):
-            self._should_reconnect = should_reconnect
-        try:
-            uri = f'ws{"s" if self._ssl_context else ""}://{self._host}:{self._port}'
-            self.ws = await connect(uri, max_size=MAX_SIZE, ssl=self._ssl_context)
-            if not self._listen_task:
-                self._listen_task = asyncio.create_task(self.listen())
-            asyncio.ensure_future(self.connection_made())
-        except (ConnectionRefusedError, gaierror, InvalidMessage, ConnectionResetError, ConnectionAbortedError, TimeoutError):
-            if self._should_reconnect:
-                # print("auto reconnecting")
-                asyncio.ensure_future(self._reconnect())
-        except Exception as e:
-            print("connect new error happened. add this to upper except")
-            print(e, type(e))
-            if self._should_reconnect:
-                asyncio.ensure_future(self._reconnect())
+    async def wait_until_connected(self):
+        """
+        This function blocks until connection made
+        """
+        if not self.connected:
+            return await self._wait_until_connected_future
 
     async def _resend_tasks(self):
         task: asyncio.Future
@@ -345,18 +340,6 @@ class AsyncIpcClient(AsyncIpcBase):
         self.tasks.clear()
         self.proxy.reset_count()
 
-    async def _reconnect(self):
-        # print(f"Sleeping {self._reconnect_delay} then reconnecting. Client: {self.client_name} - Server: {self.server_name}")
-        await asyncio.sleep(self._reconnect_delay)
-        await self.disconnect()
-        await self.connect()
-        if self.connected:
-            if self._should_resend:
-                await self._resend_tasks()
-            else:
-                self._clear_tasks()
-        self._calculate_reconnect_delay()
-
     def _calculate_reconnect_delay(self):
         if self.connected:
             self._reconnect_delay = 0
@@ -364,13 +347,13 @@ class AsyncIpcClient(AsyncIpcBase):
             self._reconnect_delay = min(1 + self._reconnect_delay * 1.2, RECONNECT_MAX_TIME)
 
     async def connection_lost(self):
-        if not self._should_resend:
+        if not self.resend:
             self._clear_tasks()
         self._call_connection_lost_callback()
-        if self._should_reconnect:
-            asyncio.ensure_future(self._reconnect())
 
     async def connection_made(self):
+        if self.resend:
+            await self._resend_tasks()
         self._call_connection_made_callback()
 
 
